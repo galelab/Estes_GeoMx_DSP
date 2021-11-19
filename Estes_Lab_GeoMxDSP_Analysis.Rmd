@@ -1,0 +1,672 @@
+# Load Libraries
+```{r, echo=TRUE, message=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+setwd("Z:/Users/dnewho/Estes_GeoMx/")
+library(RUVSeq)
+library(ruv)
+library(limma)
+library(pheatmap)
+library(ggplot2)
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(gridExtra)
+library(dplyr)
+library(openxlsx)
+library(grid)
+```
+
+#Get Raw Data & Clean for downstream analyses
+```{r}
+counts<-read.xlsx("Estes Lab GeoMX DSP CTA experiment with RAW data_03182021.xlsx",
+                  sheet = 3, # target count matrix provided by NanoString
+                  rowNames = T)
+
+colnames(counts) <- gsub(".|.","_", colnames(counts),fixed=T)
+colnames(counts) <- gsub("Geometric.Segment","Geometric_Segment", colnames(counts),fixed=T)
+
+#Get Design
+design <-read.xlsx("Estes Lab GeoMX DSP CTA experiment with RAW data_03182021.xlsx",
+                  sheet = 1,
+                  rowNames = F)
+design$SegmentDisplayName <- gsub(" | ","_", design$SegmentDisplayName,fixed=T)
+design$SegmentDisplayName <- gsub("Geometric Segment","Geometric_Segment",design$SegmentDisplayName,fixed=T)
+
+row.names(design)=design$SegmentDisplayName
+
+#There are two extra samples in the design that aren't in counts
+setdiff(row.names(design),colnames(counts))
+#  "35661_CTA_006_Center" "35661_CTA_011_ring2" 
+
+designnew = design[colnames(counts),] # removes the missing two samples
+countsnew<-floor(counts) # analysis need integers. Let's round down.
+
+#There are 32 HouseKeeping "Control" genes. Let's use these to help normalize
+hk<-c("TFRC","ARMH3","NRDE2","HPRT1","UBB","DNAJC14","ACTB","RPLP0","GPI","POLR2A","EIF2B4","ERCC3","RAB7A","GUSB","OAZ1","SF3A1","MRPL19","TUBB","ABCF1","POLR1B","TPM4","TLK2","PSMB2","HDAC3","PUM1","TMUB2","G6PD","STK11IP","PSMC4","TBC1D10B","TBP")
+
+##  Explore Raw Count distribution
+# 1. No Normalization
+ses = newSeqExpressionSet(counts = as.matrix(countsnew), phenoData = designnew)
+plotRLE(ses, outline=F,xaxt="t", las=3, main='Raw Counts', ylab="RLE")
+
+# 2. Nanostring uses Q3 normalization, i.e. upper quartile. How does this normalization impact count distribution?
+ses1<-betweenLaneNormalization(ses,which = "upper")
+plotRLE(ses1, outline=F, xaxt="n", main='Q3 Quantile Norm', ylab="RLE")
+
+# 3. What about Full Quantile Normalization?
+ses2<-betweenLaneNormalization(ses,which = "full")
+plotRLE(ses2, outline=F, xaxt="n", main='Quantile Norm', ylab="RLE")
+
+### Moving into final normalization to incorporate housekeeping genes - Normalization with RUVg. 
+# Adapted from :
+# Original Blog Posts: https://support.bioconductor.org/p/109778/ & https://support.bioconductor.org/p/123295/ 
+# Publication: https://academic.oup.com/bib/article/22/3/bbaa163/5891144 
+# Code: https://github.com/bhattacharya-a-bt/CBCS_normalization 
+
+
+# Raw Counts
+normSES = RUVg(ses, 
+    hk, 
+    k = 2)
+
+#Upper quartile normalization
+normSESQ3 = RUVg(ses1, 
+    hk, 
+    k = 2)
+
+#Full Quantile Normalization
+normSESfullQ = RUVg(ses2, 
+    hk, 
+    k = 2)
+
+plotRLE(normSES, outline=F, xaxt="n", main='Raw RUVg Norm', ylab="RLE")
+plotRLE(normSESQ3, outline=F, xaxt="n", main='Q3 RUVg Norm', ylab="RLE")
+plotRLE(normSESfullQ, outline=F, xaxt="n", main='Full Quantile RUVg Norm', ylab="RLE")
+
+# Get factors of unwanted variation for future use
+W_1 <- normSESfullQ$W_1 
+W_2 <- normSESfullQ$W_2
+factors <- cbind(W_1,W_2)
+```
+
+# Exploring lowly expressed genes. 
+# Alternatively, we could start with raw counts and filter based on negative probe expression. This removes genes with consistent low signal across the dataset. Not done here, but worth exploring.
+```{r}
+# Filter lowly expressed genes based on expression of NegProbe-WTX
+y <- DGEList(counts=counts)
+A <- rowMeans(y$counts)
+A["Negative Probe"] # 154 
+isexpr <- A > 154
+y <- y[isexpr,]
+dim(y)
+```
+
+# Standard nCounter uses positive controls, negative controls, and housekeeping genes to normalize. GeoMx seems to use "Q3" normalization.
+From nanostring: "Q3 normalization uses the top 25% of expressers to normalize across ROIs/segments, so it is robust to changes in expression of individual genes and ideal for making comparisons across ROIs/segments."
+Full quantile normalization looks better here.
+
+```{r}
+treatment <- factor(designnew$SegmentLabel, levels = unique(designnew$SegmentLabel))
+animalID <- factor(designnew$SlideName, levels = unique(designnew$SlideName))
+
+# Here, we normalize the data using the factors of unwanted variation in the linear model
+# We also do not include SIV/anti CD21 treatment status yet, as we want normalization to be blind to the main effect that we will be testing for.
+# We then proceed through voom transformation and downstream limma based differential expression testing.
+lmdesign <- model.matrix(~0 + treatment + factors)
+is.fullrank(lmdesign)
+nonEstimable(lmdesign)
+
+y <- DGEList(counts=countsnew)
+
+# Running voom & duplicateCorrelation twice is recommended by limma authors
+# https://support.bioconductor.org/p/114663/
+eset_voom  <- voom(y, 
+                   design=lmdesign,
+                   normalize.method = "none",
+                   plot = T)
+
+
+corfit <- duplicateCorrelation(eset_voom,
+                              lmdesign,
+                              block=animalID) # account for repeated sampling of individuals
+
+eset_voom  <- voom(y, 
+                   design=lmdesign,
+                   block=animalID,
+                   correlation=corfit$consensus.correlation,
+                   normalize.method = "none",
+                   plot = T)
+
+corfit <- duplicateCorrelation(eset_voom,
+                              lmdesign,
+                              block=animalID) 
+
+corfit$consensus.correlation
+
+norm_matrix <- eset_voom$E
+
+boxplot(eset_voom$E,ylab = "log2 Expression", main = "Voom Transformation", cex.axis=.6, las=2)
+
+plotMDS(eset_voom, top=300, gene.selection="common")
+
+dat.dist<-dist(t(eset_voom$E))
+plot(hclust(dat.dist),labels = designnew$SlideName,cex=.75)
+
+###Densities after normalization
+plotDensities((y$counts), legend = FALSE)
+plotDensities((eset_voom$E), legend = FALSE)
+
+#write.csv(eset_voom$E,file="EstesLab_GeoMx_NormalizedCounts.csv")
+```
+
+```{r}
+#### PCA Exploration
+contrasting2 = colorRampPalette(rev(c("chocolate2","chocolate1","white","skyblue","deepskyblue3")))(100)
+
+
+p <- PCAtools::pca(eset_voom$E, 
+         metadata = designnew)
+
+PCAtools::biplot(p, x='PC1', y='PC2', 
+       lab=NULL, 
+       colby='SegmentLabel',
+      colkey = c('Center'='darkred','Geometric Segment'='black','ring1'='steelblue','ring2'='mediumpurple'),
+#    colkey = c('35661'='grey','35684'='black','37170'='steelblue','37172'='chocolate4'),
+     #  colkey = c('FALSE'='steelblue','TRUE'='darkred','FALSE (virions observed)'='black'),
+
+       shape='SlideName',
+       pointSize = 4,
+       legendPosition = 'right',
+       #hline=0, 
+       #vline=0,
+       axisLabSize = 24,
+       legendLabSize = 20,
+       legendTitleSize = 24,
+       showLoadings = FALSE,
+       legendIconSize = 8,
+       gridlines.major = FALSE,
+       gridlines.minor = FALSE)
+
+ggsave("Estes_PCA_SegmentLabel.pdf", 
+       plot=last_plot(), 
+       device=cairo_pdf, 
+       path=NULL, 
+       scale=1, 
+       width=12, height=6, 
+       dpi=900, limitsize=TRUE)
+
+```
+
+```{r}
+# Differential Expression, testing for the effect of SIV and Anti CD21 treatment status across different regions
+designnew$Segment_Infection<-paste(designnew$SegmentLabel,designnew$`SIV+`, sep="_") # Grouping variable
+designnew$Segment_Infection<-gsub("Geometric Segment","Geometric_Segment",designnew$Segment_Infection)
+Segment_Infection <- factor(designnew$treatment, levels = unique(designnew$treatment))
+
+designnew$treatment=paste(designnew$Segment_Infection,designnew$`Treated.(anti-CD21)`,sep="_")
+
+
+treatment <- factor(designnew$treatment, levels = unique(designnew$treatment))
+
+mm <- model.matrix(~0 + treatment + factors)
+is.fullrank(mm)
+nonEstimable(mm)
+
+
+fit <- lmFit(eset_voom,
+             block=animalID,
+            correlation=corfit$consensus.correlation,
+             mm)
+
+
+
+# Exploring different contrasts
+cont.matrix<-makeContrasts(
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentCenter_TRUE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentring1_TRUE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentring2_TRUE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentCenter_TRUE_No_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentring1_TRUE_No_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentring2_TRUE_No_Treatment,
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentCenter_FALSE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentring1_FALSE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_CD21_Treatment-treatmentring2_FALSE_CD21_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentCenter_FALSE_No_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentring1_FALSE_No_Treatment,
+     #treatmentGeometric_Segment_NA_No_Treatment-treatmentring2_FALSE_No_Treatment,
+     #treatmentCenter_TRUE_CD21_Treatment-treatmentCenter_TRUE_No_Treatment,
+     #treatmentring1_TRUE_CD21_Treatment-treatmentring1_TRUE_No_Treatment,
+     #treatmentring2_TRUE_CD21_Treatment-treatmentring2_TRUE_No_Treatment,
+     treatmentCenter_TRUE_CD21_Treatment-treatmentCenter_FALSE_CD21_Treatment,
+     #treatmentring1_TRUE_CD21_Treatment-treatmentring1_FALSE_CD21_Treatment,
+     #treatmentring2_TRUE_CD21_Treatment-treatmentring2_FALSE_CD21_Treatment,
+     #treatmentCenter_TRUE_No_Treatment-treatmentCenter_FALSE_No_Treatment,
+     #treatmentring1_TRUE_No_Treatment-treatmentring1_FALSE_No_Treatment,
+     #treatmentring2_TRUE_No_Treatment-treatmentring2_FALSE_No_Treatment,
+     #treatmentCenter_FALSE_CD21_Treatment-treatmentCenter_TRUE_No_Treatment,
+     #treatmentring1_FALSE_CD21_Treatment-treatmentring1_TRUE_No_Treatment,
+     #treatmentring2_FALSE_CD21_Treatment-treatmentring2_TRUE_No_Treatment,
+levels=mm)
+
+cont.matrix<-makeContrasts(
+     treatmentGeometric_Segment_NA_CD21_Treatment-treatmentGeometric_Segment_NA_No_Treatment,
+ levels=mm)
+# 
+fit2 <- contrasts.fit(fit,cont.matrix)
+fit2 <-eBayes(fit2, robust = TRUE)
+
+results <- decideTests(fit2, 
+                       lfc=(0.58), 
+                       method="separate", 
+                       adjust.method="BH", 
+                       p.value=0.05)
+summary(results)
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+sigMask <- subset(sigMask, rowSums(sigMask) != 0)
+dim(sigMask)
+length(sigMask)
+
+png("Estes_globalmodulesheatmap.png",width = 15, height = 12, units = 'in', res = 900)
+global_modulesNT <- heatmap.F.rownames(ExpressMatrix, 
+                                     cutoff = 3, 
+                                     distmethod = "bicor", 
+                                     clustermethod = "ward.D", 
+                                     clusterdim='row',
+                                     colsep =c(3,6,9,12,15,18,21),
+                                     cexCol = 2,
+                                     key=F,
+                                     labRow = FALSE,
+                                     #ColSideColors = colcolors,
+                                     labCol = c("BCF-Cent","BCF-ring1","BCF-ring2","BCF-Cent","BCF-ring1","BCF-ring2","BCF-Cent","BCF-ring1","BCF-ring2","BCF-Cent","BCF-ring1","BCF-ring2","Cent","ring1","ring2","Cent","ring1","ring2","Cent","ring1","ring2","Cent","ring1","ring2" )
+)
+
+dev.off()
+
+for (mod in unique(global_modulesNT$modules)) {
+  gm<-as.data.frame(global_modulesNT$modules)
+  gm<-gm %>% rownames_to_column('gene')
+  tmp<-filter(gm, gm$`global_modulesNT$modules`==mod)
+  tmp <- tmp %>% column_to_rownames('gene')
+  tmp$`global_modulesNT$modules`<-NULL
+  filename<-paste('GlobalModules_EstesGeoMx', mod, 'txt', sep = '.')
+  write.table(tmp,file=filename,quote = F)
+}
+```
+
+# BCFs: Treatment vs No Treatment
+```{r}
+nm_GS<-norm_matrix[,grep("Geometric", colnames(norm_matrix))]
+
+breaksList=seq(-3, 3, by = .1)
+contrasting2 = colorRampPalette(rev(c("deepskyblue3","skyblue","white","chocolate1","chocolate2")))(100)
+contrasting3 = colorRampPalette(rev(c('darkblue', 'mediumblue', 'dodgerblue', 'white', 'orange', 'red', 'darkred')))(100)
+contrasting4 = colorRampPalette(rev(c("steelblue4","deepskyblue3","skyblue","white","chocolate1","chocolate2","chocolate4")))(100)
+
+BCF_Tx_vs_No<-topTable(fit2, coef=1, adjust.method="BH",number=Inf, sort.by = "p",p.value=0.05,lfc=0.58)
+write.csv(BCF_Tx_vs_No,file="BCF_Tx_vs_NoTx.csv")
+
+designGS<-design[colnames(nm_GS),]
+annot = data.frame(
+  Tx = factor(designGS$`Treated.(anti-CD21)`))
+row.names(annot) <- colnames(nm_GS)
+
+ann_colors = list(
+    Tx = c('CD21_Treatment' = "black", 'No_Treatment' = "grey"))
+
+png("Estes_BCF_Tx_vsNoTx.png",width = 8, height = 10, units = 'in', res = 900)
+pheatmap(nm_GS[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         show_rownames = F, show_colnames = F,
+         border_color="black", 
+         annotation_col = annot,
+         annotation_colors = ann_colors,
+         breaks = breaksList,
+         main="BCF: Treatment vs No Tx")
+dev.off()
+```
+
+# SIV+ vs SIV- Centers
+```{r}
+cont.matrixSIV_tx<-makeContrasts(
+     treatmentCenter_TRUE_CD21_Treatment-treatmentCenter_FALSE_CD21_Treatment,
+     #(treatmentCenter_TRUE_CD21_Treatment + treatmentCenter_TRUE_No_Treatment) - (treatmentCenter_FALSE_CD21_Treatment + treatmentCenter_FALSE_No_Treatment),
+     #treatmentCenter_TRUE_No_Treatment-treatmentCenter_FALSE_No_Treatment,
+levels=mm)
+
+# 
+fit2 <- contrasts.fit(fit,cont.matrixSIV_tx)
+fit2 <-eBayes(fit2, robust = TRUE)
+
+results <- decideTests(fit2, 
+                       lfc=(0.58), 
+                       method="separate", 
+                       adjust.method="BH", 
+                       p.value=0.05)
+summary(results)
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+
+nm_c<-norm_matrix[,grep("Center", colnames(norm_matrix))]
+designC<-design[colnames(nm_c),]
+annotSIV = data.frame(
+  SIV = factor(designC$`SIV+`),
+  Tx = factor(designC$`Treated.(anti-CD21)`))
+row.names(annotSIV) <- colnames(nm_c)
+
+ann_colorsSIV = list(
+    SIV = c('TRUE' = "darkred", 'FALSE' = "thistle3"),
+    Tx = c('No_Treatment' = 'grey', 'CD21_Treatment' = 'black'))
+
+png("Estes_TX_SIV.png",width = 8, height = 10, units = 'in', res = 900)
+pheatmap(nm_c[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         show_rownames = F, show_colnames = T,
+         border_color="black", 
+         annotation_col = annotSIV,
+         annotation_colors = ann_colorsSIV,
+         breaks = breaksList,
+         main="Tx: SIV+ vs SIV-, n=319 genes")
+dev.off()
+```
+
+
+# SIV+ Centers vs Rings
+```{r}
+cont.matrixCentVsRings<-makeContrasts(
+     treatmentCenter_TRUE_CD21_Treatment-treatmentring1_TRUE_CD21_Treatment,
+      treatmentCenter_TRUE_CD21_Treatment-treatmentring2_TRUE_CD21_Treatment,
+     treatmentCenter_TRUE_No_Treatment-treatmentring1_TRUE_No_Treatment,
+      treatmentCenter_TRUE_No_Treatment-treatmentring2_TRUE_No_Treatment,
+levels=mm)
+
+# 
+fit2 <- contrasts.fit(fit,cont.matrixCentVsRings)
+fit2 <-eBayes(fit2, robust = TRUE)
+
+results <- decideTests(fit2, 
+                       lfc=(0.58), 
+                       method="separate", 
+                       adjust.method="BH", 
+                       p.value=0.05)
+summary(results)
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+
+
+png("Estes_SIVpos_CentvsRings_EM.png",width = 6, height = 5, units = 'in', res = 900)
+pheatmap(ExpressMatrix,
+         #scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = F,
+         show_rownames = F, show_colnames = F,
+         border_color="black", 
+         #annotation_col = annotSIV,
+         #annotation_colors = ann_colorsSIV,
+         breaks = breaksList,
+         main="")
+dev.off()
+#
+nm_c<-norm_matrix[,grep("Center", colnames(norm_matrix))]
+nm_r<-norm_matrix[,grep("ring", colnames(norm_matrix))]
+nm_cr<-cbind(nm_c,nm_r)
+
+designCR<-design[colnames(nm_cr),]
+annotSIV = data.frame(
+  SIV = factor(designCR$`SIV+`),
+  Tx = factor(designCR$`Treated.(anti-CD21)`),
+  Segment = factor(designCR$SegmentLabel))
+row.names(annotSIV) <- colnames(nm_cr)
+
+ann_colorsSIV = list(
+    SIV = c('TRUE' = "darkred", 'FALSE' = "thistle3"),
+    Tx = c('No_Treatment' = 'grey', 'CD21_Treatment' = 'black'),
+    Segment = c('Center' = 'cyan', 'ring1' = 'mediumpurple', 'ring2' = 'dodgerblue'))
+#
+
+pheatmap(nm_cr[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         show_rownames = F, show_colnames = T,
+         border_color="black", 
+         annotation_col = annotSIV,
+         annotation_colors = ann_colorsSIV,
+         breaks = breaksList,
+         main="")
+```
+
+
+
+
+# Example:
+# Export results from SIV+ vs SIV- centers during Treatment
+```{r}
+Tx_Center<-topTable(fit, coef=1, adjust.method="BH",number=Inf, sort.by = "p",p.value=0.05,lfc=0.58)
+write.csv(Tx_Center,file="Treatment_SIVpos_vs_SIVneg_Center.csv")
+
+```
+
+
+# Volcano Plot Example
+```{r}
+BCF_TxvxNo <- topTable(fit2,coef = 1, sort.by='p', adjust.method = "none", p.value=1, number = 1812)
+
+#BCF Tx vs No Tx Volcano
+pdf(file="BCF_Tx_vs_NoTx_volcano.pdf",width=6,height=4)
+with(BCF_TxvxNo, plot(logFC, -log10(P.Value), pch=21, col="gray90", bg="grey", main="", cex.main=1, 
+                 #ylim=c(0,4),
+                 #xlim=c(-1.25,1.25), 
+                 xlab="Log2FC", ylab="-log10 FDR"))
+with(subset(BCF_TxvxNo, logFC >.58 & P.Value <.05), points(logFC, -log10(P.Value), pch=21, col="black", bg="chocolate1"))
+with(subset(BCF_TxvxNo, logFC < -.58 & P.Value <.05), points(logFC, -log10(P.Value), pch=21, col="black", bg="steelblue"))
+#with(subset(BCF_CenterT, logFC > .45 & P.Value <.003), text(logFC, -log10(P.Value), labels=c("PDCD1","CD6"), font=4,pos=4))
+#with(subset(BCF_CenterT, logFC < 0 & P.Value <.001), text(logFC, -log10(P.Value), labels=c("CCL18"), font=4,pos=2))
+abline(h=1.3,v=c(-.58,.58),lty=2)
+dev.off()
+```
+
+
+
+
+# Exporing Nanotrsing Q3 counts
+# Nanostring provided normalized counts in the Excel File, output from their analysis suite software.
+```{r}
+counts<-read.xlsx("Estes Lab GeoMX DSP CTA experiment with RAW data_03182021.xlsx",
+                  sheet = 2,
+                  rowNames = F)
+counts$names<-paste(counts$ScanLabel,counts$ROILabel,counts$SegmentLabel,sep="_")
+
+counts$ScanLabel<-NULL
+counts$SegmentLabel<-NULL
+counts$ROILabel<-NULL
+
+row.names(counts)=counts$names
+counts$names<-NULL
+counts=t(counts)
+
+setdiff(row.names(design),colnames(counts))
+row.names(designnew) = colnames(counts)
+countsnew<-floor(counts) # analysis need integers. Let's round down.
+
+ses = newSeqExpressionSet(counts = as.matrix(countsnew), phenoData = designnew)
+plotRLE(ses, outline=F,xaxt="n", main='Nanostring Provided Q3 Counts', ylab="RLE")
+
+```
+
+
+# High Level DE analysis
+```{r}
+designnew$SegmentLabel <- gsub("Geometric Segment","Geometric_Segment",designnew$SegmentLabel,fixed=T)
+
+designnew$treatment2<-paste(designnew$SegmentLabel,designnew$`SIV+`,sep="_")
+treatment2 <- factor(designnew$treatment2, levels = unique(designnew$treatment2))
+
+mm <- model.matrix(~0 + treatment2 + factors)
+is.fullrank(mm)
+nonEstimable(mm)
+
+
+fit <- lmFit(eset_voom,
+             mm)
+
+cont.matrixSIV_tx<-makeContrasts(
+     treatment2Center_TRUE - treatment2Center_FALSE,
+levels=mm)
+
+# 
+fit2 <- contrasts.fit(fit,cont.matrixSIV_tx)
+fit2 <-eBayes(fit2, robust = TRUE)
+
+results <- decideTests(fit2, 
+                       lfc=(0.58), 
+                       method="separate", 
+                       adjust.method="BH", 
+                       p.value=0.05)
+summary(results)
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+
+ExpressMatrix<-as.matrix(ExpressMatrix[c(-15),])
+
+nm_c<-norm_matrix[,grep("Center", colnames(norm_matrix))]
+designC<-design[colnames(nm_c),]
+annotSIV = data.frame(
+  SIV = factor(designC$`SIV+`),
+  Tx = factor(designC$`Treated.(anti-CD21)`))
+row.names(annotSIV) <- colnames(nm_c)
+
+ann_colorsSIV = list(
+    SIV = c('TRUE' = "darkred", 'FALSE' = "thistle3"),
+    Tx = c('No_Treatment' = 'grey', 'CD21_Treatment' = 'black'))
+
+png("Estes_AllCenters_SIV.png",width = 8, height = 10, units = 'in', res = 900)
+pheatmap(nm_c[row.names(ExpressMatrix),],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         show_rownames = T, show_colnames = T,
+         border_color="black", 
+         annotation_col = annotSIV,
+         annotation_colors = ann_colorsSIV,
+         breaks = breaksList,
+         main="All Centers: SIV+ vs SIV-, n=51 genes")
+dev.off()
+
+write.csv(ExpressMatrix,file="AllCenters_SIVposVSSIVneg.csv")
+write.fit(fit2, file="AllCenters_SIVpos_vsNeg_limmaresults.csv", digits=3, method="separate", adjust="BH",sep=",")
+
+
+rnkfile <- data.frame(names = row.names(dataMatrix), dataMatrix)
+row.names(rnkfile)<-NULL
+
+library(WebGestaltR)
+WebGestaltR(enrichMethod="GSEA",
+              organism="hsapiens",
+              interestGene=rnkfile,
+              projectName = "Centers_SIVpos_vs_neg_BTM",
+              saveRawGseaResult=FALSE,
+              isOutput = TRUE,
+              minNum=5,
+              interestGeneType="genesymbol",
+              enrichDatabase = c("community-contributed_Hallmark50",
+                                 "geneontology_Biological_Process",
+                                 "pathway_KEGG"),
+              enrichDatabaseType = "genesymbol",
+              sigMethod = "fdr", fdrMethod = "BH", fdrThr = 0.05, nThreads=8)
+
+
+### IL-10 Network HEatmap
+il10<-read.table("il10_network_genes.txt")
+il10genes<-unique(il10$V1)
+
+png("Estes_AllCenters_SIV_IL10_genes.png",width = 8, height = 10, units = 'in', res = 900)
+pheatmap(nm_c[il10genes,],
+         scale="row", 
+         color = colorRampPalette(rev(c(name = contrasting3)))(length(breaksList)),
+         cluster_rows = T,
+         cluster_cols = T,
+         cutree_rows =  2,
+         show_rownames = T, show_colnames = F,
+         border_color="black", 
+         annotation_col = annotSIV,
+         annotation_colors = ann_colorsSIV,
+         breaks = breaksList,
+         main="All Centers: SIV+ vs SIV-, IL-10 Target genes")
+dev.off()
+```
+
+
+# Nanostring Spatial Decon
+# Cell Type Deconvolution tool designed by NanoString for spatial omic data.
+# Code below was only exploratory and is included for reference.
+```{r}
+devtools::install_github("Nanostring-Biostats/SpatialDecon",
+                         ref = "master", 
+                         build_vignettes = FALSE)
+library(SpatialDecon)
+data("safeTME")
+data("safeTME.matches")
+signif(safeTME[seq_len(3), seq_len(3)], 2)
+heatmap(sweep(safeTME, 1, apply(safeTME, 1, max), "/"),
+        labRow = NA, margins = c(10, 5))
+
+# use the NegProbe to estimate per-observation background
+per.observation.mean.neg = norm_matrix["Negative Probe", ]
+# and define a background matrix in which each column (observation) is the
+# appropriate value of per-observation background:
+bg = sweep(norm_matrix * 0, 2, per.observation.mean.neg, "+")
+dim(bg)
+
+
+res = spatialdecon(norm = norm_matrix,
+                   bg = bg,
+                   X = safeTME,
+                   align_genes = TRUE)
+str(res)
+heatmap(res$beta, cexCol = 0.5, cexRow = 0.7, margins = c(10,7))
+CellTypeFreq<-res$beta
+
+eset_voomCells  <- voom(CellTypeFreq, 
+                   design=lmdesign,
+                   normalize.method = "none",
+                   plot = T)
+
+fit <- lmFit(eset_voomCells,
+             mm)
+
+cont.matrixSIV_tx<-makeContrasts(
+     treatment2Center_TRUE - treatment2Center_FALSE,
+levels=mm)
+
+fit2 <- contrasts.fit(fit,cont.matrixSIV_tx)
+fit2 <-eBayes(fit2, robust = TRUE)
+
+results <- decideTests(fit2, 
+                       #lfc=(0.58), 
+                       method="separate", 
+                       adjust.method="none", 
+                       p.value=0.05)
+summary(results)
+
+dataMatrix <- fit2$coefficients # Extract results of differential expression
+sigMask <- dataMatrix * (results**2) # 1 if significant, 0 otherwise
+ExpressMatrix <- subset(dataMatrix, rowSums(sigMask) != 0) # filter for significant genes
+
+```
+
